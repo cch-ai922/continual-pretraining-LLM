@@ -1,0 +1,40 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Model checkpoints & tokenized data (large binary artifacts produced by the pipeline)
+*.bin
+*.idx
+*.safetensors
+*.pt
+*.pth
+*.gguf
+*.npy
+*.npz
+
+# Local pipeline outputs (regenerated; do not version)
+/data/
+/mcore_ckpt*/
+/qwen3-ko-*/
+blend.yaml
+blend_long.yaml
+thresholds.json
+
+# Secrets
+.env
+.env.*
+!.env.example
+secrets.json
+*.key

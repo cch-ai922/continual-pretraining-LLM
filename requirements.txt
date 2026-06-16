@@ -1,0 +1,22 @@
+# Core
+transformers>=4.51        # REQUIRED for Qwen3 (NOT the 5.2 that Qwen3.5 needs)
+tokenizers>=0.20
+torch>=2.4
+numpy
+pyyaml
+datasets
+# sentencepiece is NOT needed (Qwen uses byte-level BPE; tokenizers handles it).
+# Only install it if some other dependency pulls it in.
+
+# Data generation / rejection sampling / eval (inference at scale)
+vllm                       # recommended for generate_grounded_ko, rejection_sample, 09_eval
+accelerate>=0.34           # used by the TRL SFT/DPO/GRPO alternatives
+
+# Stage 5/6 (optional simpler paths)
+trl>=0.12                  # if using TRL DPO/GRPO alternative
+peft>=0.13
+
+# Training framework (pick one):
+#  - Megatron-Bridge (recommended): install per NVIDIA docs / NGC container; has the Qwen3 provider
+#    + bidirectional HF<->Megatron conversion. https://docs.nvidia.com/nemo/megatron-bridge
+#  - Vanilla Megatron-LM also works for Qwen3 (standard dense arch) via its Qwen/HF converter.
