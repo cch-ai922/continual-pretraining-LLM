@@ -14,6 +14,11 @@ What it reports
 ---------------
   * Korean fluency proxy : mean Korean fraction on the Korean slice
   * Code-switching rate  : % of Korean-expected responses that leak Latin script
+  * Register consistency : mean 높임말/문체 consistency score on the Korean slice,
+                           % of Korean responses that mix registers within a turn,
+                           and the dominant-bucket breakdown (what register the
+                           model is defaulting to). Mix-within-a-response is the
+                           D6 failure mode the playbook flags as non-negotiable.
   * Verifiable accuracy  : dispatches to 08_reasoning/verify_<name>.py (math, mcq,
                            code, logic, format) when rows carry a gold answer
   * English regression   : the SAME metrics on rows tagged lang="en" — this is how
@@ -48,6 +53,12 @@ Run:
     python eval_report.py --selftest
 """
 import argparse, importlib, inspect, json, os, sys, unicodedata
+
+# Sibling-stage module (register check lives in 05_sft/). Works whether this
+# script is run from project root or from 09_eval/ directly.
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                "..", "05_sft"))
+from register_consistency import consistency_score as _register_consistency_score
 
 
 # ---------------------------------------------------------------------------
@@ -111,12 +122,17 @@ def _verify_one(verify, pred, gold, row):
 
 
 def score_rows(rows, verify=None, default_verifier=None, verifier_fns=None,
-               min_korean=0.6, max_latin=0.15):
+               min_korean=0.6, max_latin=0.15,
+               register_threshold=0.8, register_min_sents=2):
     """Aggregate metrics over rows. Pure function over a list of dicts.
 
     verifier_fns : optional {name: verify_callable} so per-row "verifier" works
                    without importing anything (used by --selftest).
     Returns a nested dict of metrics, split by language slice.
+
+    Register-consistency metrics are computed for every row, but aggregated only
+    over Korean-expected rows whose response has >= register_min_sents register-
+    bearing sentences (English text never qualifies, so it sits out cleanly).
     """
     slices = {"ko": [], "en": [], "all": []}
     for row in rows:
@@ -126,6 +142,17 @@ def score_rows(rows, verify=None, default_verifier=None, verifier_fns=None,
         rec["_korean_fraction"] = korean_fraction(pred)
         rec["_latin_fraction"] = latin_fraction(pred)
         rec["_code_switched"] = is_code_switched(pred, min_korean, max_latin)
+
+        # register consistency (deterministic; rows without enough Korean
+        # register-bearing sentences come back as n=0 -> dominant=None and are
+        # excluded from the aggregate).
+        r_score, r_dom, r_n = _register_consistency_score(pred)
+        rec["_register_score"] = r_score
+        rec["_register_dominant"] = r_dom
+        rec["_register_n_sents"] = r_n
+        rec["_register_consistent"] = (
+            r_n < register_min_sents or r_score >= register_threshold
+        )
 
         # accuracy (optional)
         rec["_verified"] = None
@@ -147,6 +174,15 @@ def score_rows(rows, verify=None, default_verifier=None, verifier_fns=None,
             return None
         graded = [r["_verified"] for r in recs if r["_verified"] is not None]
         ko_expected = [r for r in recs if r.get("lang", "ko") == "ko"]
+        # Register aggregates: only over ko_expected rows with enough register-
+        # bearing Korean sentences to actually judge.
+        reg_judgable = [r for r in ko_expected
+                        if r["_register_n_sents"] >= register_min_sents]
+        bucket_counts = {"합쇼체": 0, "해요체": 0, "문어체": 0, "해체": 0}
+        for r in reg_judgable:
+            d = r["_register_dominant"]
+            if d in bucket_counts:
+                bucket_counts[d] += 1
         return {
             "n": len(recs),
             "accuracy": (sum(graded) / len(graded)) if graded else None,
@@ -155,6 +191,14 @@ def score_rows(rows, verify=None, default_verifier=None, verifier_fns=None,
                                     / len(ko_expected)) if ko_expected else None,
             "code_switch_rate": (sum(r["_code_switched"] for r in ko_expected)
                                  / len(ko_expected)) if ko_expected else None,
+            "n_register_judged": len(reg_judgable),
+            "mean_register_score": (sum(r["_register_score"] for r in reg_judgable)
+                                    / len(reg_judgable)) if reg_judgable else None,
+            "register_mix_rate": (
+                sum(1 for r in reg_judgable if not r["_register_consistent"])
+                / len(reg_judgable)
+            ) if reg_judgable else None,
+            "register_buckets": bucket_counts,
         }
 
     return {"all": agg(slices["all"]),
@@ -172,13 +216,34 @@ def format_report(metrics):
         cs = f"{m['code_switch_rate']:.1%}" if m["code_switch_rate"] is not None else " n/a"
         return (f"  {name:<8}: n={m['n']:<6} acc={acc:>6} (graded {m['n_graded']})"
                 f"  korean={hf:>6}  code-switch={cs:>6}")
+
+    def register_line(name, m):
+        if not m or m.get("n_register_judged", 0) == 0:
+            return f"  {name:<8}: register: (no judgable rows)"
+        ms = f"{m['mean_register_score']:.2f}"
+        mr = f"{m['register_mix_rate']:.1%}"
+        # bucket profile: short labels for compactness in ASCII-only logs
+        b = m["register_buckets"]
+        bucket_total = sum(b.values()) or 1
+        profile = "/".join(
+            f"{label}={100*b[bucket]//bucket_total}%"
+            for label, bucket in (("hapsyo", "합쇼체"), ("haeyo", "해요체"),
+                                  ("muneo", "문어체"), ("hae", "해체"))
+        )
+        return (f"  {name:<8}: register: n_judged={m['n_register_judged']:<4}  "
+                f"mean_score={ms}  mix_rate={mr:>6}  buckets[{profile}]")
+
     out = ["=== eval report ===",
            line("ALL", metrics["all"]),
            line("Korean", metrics["ko"]),
            line("English", metrics["en"]),
            "",
+           register_line("Korean", metrics["ko"]),
+           "",
            "  NOTE: track the English row across checkpoints — a falling English",
-           "  accuracy is catastrophic forgetting, the failure this pipeline fights."]
+           "  accuracy is catastrophic forgetting, the failure this pipeline fights.",
+           "  Register mix_rate trending up = SFT/DPO 높임말 discipline slipping;",
+           "  buckets shifting = the model is changing its default register."]
     return "\n".join(out)
 
 
@@ -193,6 +258,12 @@ def main():
                     help="default verifier for rows that carry a gold answer")
     ap.add_argument("--min-korean", type=float, default=0.6)
     ap.add_argument("--max-latin", type=float, default=0.15)
+    ap.add_argument("--register-threshold", type=float, default=0.8,
+                    help="Dominant-bucket fraction required to call a response "
+                         "register-consistent (default 0.8)")
+    ap.add_argument("--register-min-sents", type=int, default=2,
+                    help="Min register-bearing sentences for a response to be "
+                         "judged (shorter responses are excluded from the aggregate)")
     ap.add_argument("--out", default=None, help="optional: per-row metrics JSONL")
     args = ap.parse_args()
 
@@ -203,7 +274,9 @@ def main():
 
     rows = [json.loads(l) for l in open(args.inp, encoding="utf-8")]
     metrics = score_rows(rows, verify=verify, default_verifier=args.verifier,
-                         min_korean=args.min_korean, max_latin=args.max_latin)
+                         min_korean=args.min_korean, max_latin=args.max_latin,
+                         register_threshold=args.register_threshold,
+                         register_min_sents=args.register_min_sents)
     print(format_report(metrics))
 
     if args.out:
@@ -256,7 +329,39 @@ def _selftest():
     except ModuleNotFoundError:
         print("  (skipped real-verifier round-trip: 08_reasoning not on path)")
 
-    print("PASS all eval-harness tests (fractions + code-switch + accuracy + slices + dispatch)")
+    # NEW — register-consistency aggregation. Five rows mix:
+    #   1 consistent 해요체, 1 register-mixed (hapsyo+haeyo), 1 consistent 문어체,
+    #   1 too-short Korean (excluded), 1 English (excluded).
+    # Aggregates run only over Korean rows with >= min_sents register-bearing
+    # sentences -- so n_register_judged == 3.
+    reg_rows = [
+        {"prediction": "안녕하세요. 저는 학생이에요. 만나서 반가워요.", "lang": "ko"},
+        {"prediction": "안녕하십니까. 저는 학생이에요. 만나서 반갑습니다.", "lang": "ko"},
+        {"prediction": "이것은 책이다. 저것은 펜이다. 그것은 종이이다.", "lang": "ko"},
+        {"prediction": "평양", "lang": "ko"},
+        {"prediction": "Paris is the capital.", "lang": "en"},
+    ]
+    rm = score_rows(reg_rows, register_threshold=0.8, register_min_sents=2)
+    ko = rm["ko"]
+    assert ko["n_register_judged"] == 3, ko
+    # 1 of 3 judgable rows is register-mixed
+    assert abs(ko["register_mix_rate"] - 1/3) < 1e-9, ko["register_mix_rate"]
+    # mean score: 1.0 (consistent 해요체) + 2/3 (mixed) + 1.0 (consistent 문어체) = 2.667/3
+    assert abs(ko["mean_register_score"] - (1.0 + 2/3 + 1.0) / 3) < 1e-6, ko["mean_register_score"]
+    # dominant-bucket distribution: 1 해요체, 1 합쇼체 (mixed row's dominant), 1 문어체
+    assert ko["register_buckets"] == {"합쇼체": 1, "해요체": 1, "문어체": 1, "해체": 0}, ko["register_buckets"]
+    # English / too-short rows are excluded from the register aggregate
+    assert rm["en"]["n_register_judged"] == 0
+
+    # format_report must not crash on the augmented metrics
+    s = format_report(rm)
+    assert "register:" in s and "buckets[" in s, s
+
+    # threshold knob: at threshold 0.6 the mixed row (score 0.667) now passes
+    rm_loose = score_rows(reg_rows, register_threshold=0.6, register_min_sents=2)
+    assert rm_loose["ko"]["register_mix_rate"] == 0.0, rm_loose["ko"]
+
+    print("PASS all eval-harness tests (fractions + code-switch + accuracy + slices + dispatch + register)")
 
 
 if __name__ == "__main__":

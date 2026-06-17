@@ -21,21 +21,36 @@ Supported task types (each has a matching exemplars_<task>.json):
 Diversity axes — sweep these to multiply per-passage data and let the SFT model
 learn explicit register/audience following:
 
-  --exemplars exemplars_<task>_<register>.json     register variation
-       (합쇼체 / 해요체 / 문어체 — pick the file; behavior is exemplar-driven)
-
   --audience  {어린이, 중고급중학교생, 일반, 전문가, mixed}
        audience variation (instruction-driven): prepends an instruction to the
        base-model few-shot header AND prepends a short phrase to the SFT user
        message so the trained model can later follow explicit audience requests.
        'mixed' = no injection (legacy / default behavior).
 
+  --register  {합쇼체, 해요체, 문어체, mixed}
+       register variation (instruction-driven, Option A): same mechanism as
+       audience — a header instruction steers generation, an SFT-message phrase
+       teaches the trained model to follow the request. Combine with --register-
+       filter to drop outputs whose dominant register doesn't match (the
+       deterministic register check from register_consistency.py).
+       For stronger steering, ship register-specific exemplars
+       (exemplars_<task>_<register>.json — Option B) and load via --exemplars.
+       'mixed' = no injection (legacy / default behavior).
+
+  Run the script in a shell loop to sweep the cross-product
+  (audience × register × task) — multiplies effective per-passage data.
+
 Filters: language-ID (Hangul fraction) + faithfulness (content-word overlap, with
 Korean particles stripped so 조선은/조선이/조선을 count as the same word; skipped for
-`title`). For stricter filtering, run output through 05_sft/faithfulness_scorer.py,
-05_sft/register_consistency.py, and 05_sft/translationese_scorer.py.
+`title`) + optional register match (--register-filter). For stricter filtering,
+run output through 05_sft/faithfulness_scorer.py and
+05_sft/translationese_scorer.py.
 """
-import argparse, json, re, unicodedata
+import argparse, json, os, re, sys, unicodedata
+
+# Sibling module — used for the optional register post-filter.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from register_consistency import matches_target_register
 
 DELIM = "\n---\n"
 
@@ -75,13 +90,32 @@ AUDIENCES = {
                     "전문가 수준으로"),
 }
 
+# Register axis (Option A — prompt-side instruction injection, no exemplar
+# variants needed). Each entry is (build_prompt header instruction, to_chat
+# user-message phrase). Skip 해체 — chatbots rarely need 반말 responses.
+#
+# Honest limitation, same as AUDIENCES: a weak base model only loosely follows
+# a single header instruction; the exemplars likely encode a different register.
+# Pair with --register-filter to drop outputs whose dominant register doesn't
+# match. If hit rate is too low, ship register-specific exemplars (Option B).
+REGISTERS = {
+    "합쇼체": ("응답을 합쇼체(-습니다/-습니까/-십시오)로 작성하시오.",
+              "합쇼체로"),
+    "해요체": ("응답을 해요체(-요/-아요/-이에요)로 작성하시오.",
+              "해요체로"),
+    "문어체": ("응답을 문어체(-다/-이다)의 서술형 산문으로 작성하시오.",
+              "문어체로"),
+}
+
 
 # ---------------------------------------------------------------------------
 # PURE, TESTABLE CORE
 # ---------------------------------------------------------------------------
-def build_prompt(exemplars, passage, task, term=None, audience_instr=""):
-    """Build the few-shot prompt for the base model. If audience_instr is given,
-    prepend it as a single instruction header above the exemplar block."""
+def build_prompt(exemplars, passage, task, term=None,
+                 audience_instr="", register_instr=""):
+    """Build the few-shot prompt for the base model. If audience_instr and/or
+    register_instr are given, prepend them as a single combined header above
+    the exemplar block."""
     spec = TASKS[task]
     labels, inputs = spec["labels"], spec["inputs"]
     blocks = ["\n".join(f"{lab}: {ex[lab]}" for lab in labels) for ex in exemplars]
@@ -94,8 +128,9 @@ def build_prompt(exemplars, passage, task, term=None, audience_instr=""):
             open_parts.append(f"{lab}:")
             break                          # stop after the first generated label
     body = DELIM.join(blocks + ["\n".join(open_parts)])
-    if audience_instr:
-        body = f"다음 실례들을 참고하여, {audience_instr}\n\n{body}"
+    instrs = [s for s in (audience_instr, register_instr) if s]
+    if instrs:
+        body = f"다음 실례들을 참고하여, {' '.join(instrs)}\n\n{body}"
     return body, labels
 
 
@@ -130,11 +165,14 @@ def parse_completion(completion, task, labels):
     }[task]
 
 
-def to_chat(passage, parsed, task, term=None, audience_phrase=""):
-    """Build the user/assistant chat for SFT. If audience_phrase is given,
-    prepend it to the user instruction so the trained model learns to follow
-    explicit audience requests at inference."""
-    aud = f"{audience_phrase} " if audience_phrase else ""
+def to_chat(passage, parsed, task, term=None,
+            audience_phrase="", register_phrase=""):
+    """Build the user/assistant chat for SFT. If audience_phrase and/or
+    register_phrase are given, prepend them to the user instruction so the
+    trained model learns to follow explicit audience/register requests at
+    inference."""
+    pieces = [p for p in (audience_phrase, register_phrase) if p]
+    aud = " ".join(pieces) + " " if pieces else ""
     if task == "qa":
         user = (f"{aud}다음 단락을 읽고 질문에 답하시오.\n\n"
                 f"단락: {passage}\n\n질문: {parsed['question']}")
@@ -249,6 +287,15 @@ def main():
                          "few-shot header and the SFT user message. 'mixed' = no "
                          "injection (legacy/default). Sweep over the four explicit "
                          "audiences to multiply per-passage diversity.")
+    ap.add_argument("--register", choices=list(REGISTERS) + ["mixed"], default="mixed",
+                    help="Inject a register instruction (Option A — prompt-only). "
+                         "'mixed' = no injection. Pair with --register-filter to "
+                         "drop outputs whose dominant register doesn't match.")
+    ap.add_argument("--register-filter", action="store_true",
+                    help="If --register is set (not 'mixed'), drop generations whose "
+                         "dominant register doesn't match the requested one. The "
+                         "drop count is the steering miss rate — use it to decide "
+                         "whether to invest in register-specific exemplars (Option B).")
     ap.add_argument("--out", required=True)
     ap.add_argument("--min-korean", type=float, default=0.7)
     ap.add_argument("--batch", type=int, default=256)
@@ -260,14 +307,19 @@ def main():
     audience_instr, audience_phrase = (
         AUDIENCES[args.audience] if args.audience != "mixed" else ("", "")
     )
+    register_instr, register_phrase = (
+        REGISTERS[args.register] if args.register != "mixed" else ("", "")
+    )
+    register_target = args.register if args.register != "mixed" else None
 
     prompts, metas = [], []
     for r in rows:
         p, labels = build_prompt(exemplars, r["passage"], args.task, r.get("term"),
-                                 audience_instr=audience_instr)
+                                 audience_instr=audience_instr,
+                                 register_instr=register_instr)
         prompts.append(p); metas.append((r, labels))
 
-    kept = dropped = 0
+    kept = dropped = dropped_register = 0
     with open(args.out, "w", encoding="utf-8") as f:
         for i in range(0, len(prompts), args.batch):
             comps = generate(prompts[i:i + args.batch], args.model)
@@ -284,12 +336,17 @@ def main():
                     dropped += 1; continue
                 if args.task not in SKIP_FAITHFUL and not faithful(ans, r["passage"]):
                     dropped += 1; continue
+                if (args.register_filter and register_target
+                        and not matches_target_register(ans, register_target)):
+                    dropped_register += 1; continue
                 f.write(json.dumps(to_chat(r["passage"], parsed, args.task, r.get("term"),
-                                           audience_phrase=audience_phrase),
+                                           audience_phrase=audience_phrase,
+                                           register_phrase=register_phrase),
                                    ensure_ascii=False) + "\n")
                 kept += 1
-    print(f"task={args.task} audience={args.audience}: "
-          f"kept {kept:,} | dropped {dropped:,} -> {args.out}")
+    print(f"task={args.task} audience={args.audience} register={args.register}: "
+          f"kept {kept:,} | dropped {dropped:,} "
+          f"(register off-target: {dropped_register:,}) -> {args.out}")
 
 
 # ---------------------------------------------------------------------------
@@ -383,9 +440,46 @@ def _selftest():
                        audience_phrase="전문가 수준으로")
     assert chat_sum["messages"][0]["content"].startswith("전문가 수준으로 ")
 
+    # ----- register axis (Option A — prompt-only) -----
+
+    # (f) build_prompt prepends register-only instruction when audience is empty
+    r_instr, r_phrase = REGISTERS["해요체"]
+    prompt_r, _ = build_prompt(exs, passage, "qa", register_instr=r_instr)
+    assert prompt_r.startswith("다음 실례들을 참고하여, "), prompt_r[:80]
+    assert "해요체" in prompt_r.split("\n")[0]
+    assert prompt_r.rstrip().endswith("질문:")
+
+    # (g) audience + register stack in a single header (audience first, register second)
+    a_instr, a_phrase = AUDIENCES["일반"]
+    prompt_ar, _ = build_prompt(exs, passage, "qa",
+                                audience_instr=a_instr, register_instr=r_instr)
+    head = prompt_ar.split("\n")[0]
+    assert head.startswith("다음 실례들을 참고하여, ")
+    assert head.find("일반") < head.find("해요체"), head    # audience before register
+
+    # (h) to_chat combines both phrases in order
+    chat_ar = to_chat(passage, {"answer": "평양", "question": "어디?"}, "qa",
+                      audience_phrase=a_phrase, register_phrase=r_phrase)
+    content = chat_ar["messages"][0]["content"]
+    assert content.startswith("일반 성인을 대상으로 해요체로 "), content[:60]
+    assert content.find(a_phrase) < content.find(r_phrase), content
+
+    # (i) register-only to_chat
+    chat_r = to_chat(passage, {"answer": "평양", "question": "어디?"}, "qa",
+                     register_phrase=r_phrase)
+    assert chat_r["messages"][0]["content"].startswith("해요체로 ")
+
+    # (j) each of the 3 explicit registers produces a distinct header
+    seen_r = set()
+    for reg in REGISTERS:
+        instr, _ = REGISTERS[reg]
+        p_reg, _ = build_prompt(exs, passage, "qa", register_instr=instr)
+        seen_r.add(p_reg.split("\n")[0])
+    assert len(seen_r) == 3, seen_r
+
     print("PASS all grounded-generation tests (9 tasks: prompt/parse/filters/format "
-          "+ audience injection: build_prompt + to_chat + empty-default + 4-way sweep "
-          "+ non-qa coverage)")
+          "+ audience injection + register injection + audience-register stacking "
+          "+ empty-default preserved + sweep distinctness + non-qa coverage)")
 
 
 if __name__ == "__main__":

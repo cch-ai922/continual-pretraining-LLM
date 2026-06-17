@@ -6,15 +6,22 @@ low-resource model. For each prompt we sample two candidate responses from the S
 model (e.g. two temperatures) and pick chosen/rejected by these rules, in order:
 
   1. language correctness : Korean response beats a code-switched/English one
-  2. format adherence     : followed requested format (e.g. JSON/list) beats not
-  3. faithfulness         : for grounded prompts, faithful-to-source beats hallucinated
-  4. length/health        : non-degenerate (no repetition loops) beats degenerate
+  2. register consistency : single-register Korean (높임말/문체) beats mixed
+  3. format adherence     : followed requested format (e.g. JSON/list) beats not
+  4. faithfulness         : for grounded prompts, faithful-to-source beats hallucinated
+  5. length/health        : non-degenerate (no repetition loops) beats degenerate
 
 Pairs where the two candidates tie on all signals are dropped (no clear signal).
 The signal functions below are concrete and unit-tested at the bottom; the
 generation step is a hook you connect to vLLM/HF serving of your SFT model.
 """
-import argparse, json, re, unicodedata
+import argparse, json, os, re, sys, unicodedata
+
+# Sibling-module import (register check lives in 05_sft/). Works whether this
+# script is run from the project root or from 06_dpo/ directly.
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                "..", "05_sft"))
+from register_consistency import is_consistent as _register_consistent
 
 
 # ---------- verifiable signal functions (pure, testable) ----------
@@ -98,13 +105,20 @@ def faithful(s: str, source: str | None) -> bool:
 
 
 def pick(a: str, b: str, fmt=None, source=None):
-    """Return (chosen, rejected) or None if tie. a,b are candidate responses."""
+    """Return (chosen, rejected) or None if tie. a,b are candidate responses.
+
+    Signals are ranked lexicographically: only ties on a higher signal hand
+    the decision to the next one. Register consistency is the new (2nd) signal:
+    English responses pass it trivially (no Korean register markers fire), so
+    it only differentiates pairs where both candidates are Korean.
+    """
     def score(x):
         return (
             1 if korean_fraction(x) >= 0.6 else 0,       # 1. language
-            1 if follows_format(x, fmt) else 0,          # 2. format
-            1 if faithful(x, source) else 0,             # 3. faithfulness
-            0 if has_repetition(x) else 1,               # 4. health
+            1 if _register_consistent(x) else 0,         # 2. register (높임말/문체)
+            1 if follows_format(x, fmt) else 0,          # 3. format
+            1 if faithful(x, source) else 0,             # 4. faithfulness
+            0 if has_repetition(x) else 1,               # 5. health
         )
     sa, sb = score(a), score(b)
     if sa == sb:
@@ -154,11 +168,28 @@ def _selftest():
     passage = "안학궁은 평양에 있는 유명한 유적이다."
     assert faithful("안학궁은 평양에 있다.", passage), "real content overlap -> faithful"
     assert not faithful("이것은 전혀 관련이 없는 문장이다.", passage), "only common words -> unfaithful"
+
+    # NEW — register consistency as signal #2:
+    # single-register Korean beats register-mixed Korean (ties on #1 language).
+    ko_consistent = "안녕하세요. 저는 학생이에요. 만나서 반가워요."         # all 해요체
+    ko_mixed      = "안녕하십니까. 저는 학생이에요. 만나서 반갑습니다."     # 합쇼체+해요체+합쇼체
+    assert pick(ko_consistent, ko_mixed) == (ko_consistent, ko_mixed), \
+        "single-register Korean should beat register-mixed Korean"
+    # Order-insensitive
+    assert pick(ko_mixed, ko_consistent) == (ko_consistent, ko_mixed)
+
+    # Two single-register-but-different-register responses still tie on #2 and
+    # fall through to lower signals. With no format/source/repetition difference,
+    # they tie completely and are dropped.
+    ko_haeyo  = "안녕하세요. 저는 학생이에요."
+    ko_hapsyo = "안녕하십니까. 저는 학생입니다."
+    assert pick(ko_haeyo, ko_hapsyo) is None, \
+        "both consistent (different registers) -> tie -> dropped"
+
     print("PASS all preference-signal tests")
 
 
 if __name__ == "__main__":
-    import sys
     if "--selftest" in sys.argv:
         _selftest()
     else:
